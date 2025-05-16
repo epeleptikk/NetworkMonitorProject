@@ -1,0 +1,6 @@
+# Исключить временные файлы Visual Studio
+.vs/
+bin/
+obj/
+*.suo
+*.user
