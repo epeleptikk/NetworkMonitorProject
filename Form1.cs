@@ -14,6 +14,7 @@ using SharpPcap.LibPcap;
 using System.Collections;
 using System.Threading.Tasks;
 using ScottPlot;
+using System.Data.SQLite;
 
 namespace Diplom
 {
@@ -39,6 +40,10 @@ namespace Diplom
         private readonly List<double> receivedTrafficValues = new List<double>();
         private readonly List<DateTime> timeStamps = new List<DateTime>();
         private const int ChartMaxPoints = 60;
+        private const double TrafficThresholdMBps = 1.0 * 1024 * 1024; // Порог 1 МБ/с
+        private const int PacketLengthThreshold = 1500; // Порог длины пакета
+
+        private SQLiteConnection dbConnection;
 
         public Form1()
         {
@@ -48,6 +53,7 @@ namespace Diplom
             listViewNetworkTraffic.GetType().GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(listViewNetworkTraffic, true);
             listViewTcpConnections.GetType().GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(listViewTcpConnections, true);
             listViewUdpListeners.GetType().GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(listViewUdpListeners, true);
+            listViewSuspicious.GetType().GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(listViewSuspicious, true);
 
             updateTimer = new System.Windows.Forms.Timer { Interval = 5000 };
             updateTimer.Tick += async (s, args) => await UpdateNetworkDataAsync();
@@ -57,6 +63,7 @@ namespace Diplom
             chartUpdateTimer.Tick += ChartUpdateTimer_Tick;
             InitializePacketCapture();
             InitializeChart();
+            InitializeDatabase();
 
             listViewNetworkActivity.Columns[5].Text = "Load (B/s)";
             listViewNetworkTraffic.Columns[1].Text = "Avg Incoming Traffic (B/s)";
@@ -64,22 +71,59 @@ namespace Diplom
             listViewNetworkTraffic.Columns[3].Text = "Avg Total Traffic (B/s)";
         }
 
+        private void InitializeDatabase()
+        {
+            try
+            {
+                dbConnection = new SQLiteConnection("Data Source=network_monitor.db;Version=3;");
+                dbConnection.Open();
+
+                string createSuspiciousPacketsTable = @"
+                    CREATE TABLE IF NOT EXISTS SuspiciousPackets (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        Source TEXT NOT NULL,
+                        Destination TEXT NOT NULL,
+                        Protocol TEXT NOT NULL,
+                        Length INTEGER NOT NULL,
+                        Timestamp TEXT NOT NULL,
+                        SourcePort TEXT,
+                        DestPort TEXT,
+                        Reason TEXT NOT NULL
+                    )";
+                string createSuspiciousProcessesTable = @"
+                    CREATE TABLE IF NOT EXISTS SuspiciousProcesses (
+                        Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        Pid INTEGER NOT NULL,
+                        ProcessName TEXT NOT NULL,
+                        AvgTrafficBs REAL NOT NULL,
+                        Timestamp TEXT NOT NULL,
+                        Reason TEXT NOT NULL
+                    )";
+
+                using (var cmd = new SQLiteCommand(createSuspiciousPacketsTable, dbConnection))
+                { cmd.ExecuteNonQuery(); }
+                using (var cmd = new SQLiteCommand(createSuspiciousProcessesTable, dbConnection))
+                { cmd.ExecuteNonQuery(); }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error initializing database: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void ApplyVisualStyles()
         {
-            // Тёмная тема для формы
             BackColor = System.Drawing.Color.FromArgb(40, 40, 40);
             ForeColor = System.Drawing.Color.White;
             tabControl.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
             tabControl.ForeColor = System.Drawing.Color.White;
 
-            // Стили для вкладок
             tabControl.SelectedTab.BackColor = System.Drawing.Color.FromArgb(60, 60, 60);
             foreach (TabPage tab in tabControl.TabPages)
             {
                 tab.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
             }
 
-            // Стили для ListView
             listViewUdpListeners.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
             listViewUdpListeners.ForeColor = System.Drawing.Color.White;
             listViewNetworkActivity.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
@@ -88,8 +132,9 @@ namespace Diplom
             listViewNetworkTraffic.ForeColor = System.Drawing.Color.White;
             listViewTcpConnections.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
             listViewTcpConnections.ForeColor = System.Drawing.Color.White;
+            listViewSuspicious.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            listViewSuspicious.ForeColor = System.Drawing.Color.White;
 
-            // Чередование цветов строк в ListView
             listViewUdpListeners.DrawItem += (s, e) =>
             {
                 e.DrawDefault = true;
@@ -122,8 +167,15 @@ namespace Diplom
                 else
                     e.Item.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
             };
+            listViewSuspicious.DrawItem += (s, e) =>
+            {
+                e.DrawDefault = true;
+                if ((e.ItemIndex % 2) == 0)
+                    e.Item.BackColor = System.Drawing.Color.FromArgb(60, 60, 60);
+                else
+                    e.Item.BackColor = System.Drawing.Color.FromArgb(50, 50, 50);
+            };
 
-            // Стили для кнопок
             btnStart.BackColor = System.Drawing.Color.FromArgb(0, 120, 215);
             btnStart.ForeColor = System.Drawing.Color.White;
             btnPause.BackColor = System.Drawing.Color.FromArgb(255, 165, 0);
@@ -132,8 +184,11 @@ namespace Diplom
             btnStop.ForeColor = System.Drawing.Color.White;
             btnSaveToFile.BackColor = System.Drawing.Color.FromArgb(40, 167, 69);
             btnSaveToFile.ForeColor = System.Drawing.Color.White;
+            btnRefreshSuspicious.BackColor = System.Drawing.Color.FromArgb(0, 150, 136);
+            btnRefreshSuspicious.ForeColor = System.Drawing.Color.White;
+            btnClearDatabase.BackColor = System.Drawing.Color.FromArgb(153, 50, 204);
+            btnClearDatabase.ForeColor = System.Drawing.Color.White;
 
-            // Подсветка при наведении на кнопки
             btnStart.MouseEnter += (s, e) => btnStart.BackColor = System.Drawing.Color.FromArgb(0, 100, 180);
             btnStart.MouseLeave += (s, e) => btnStart.BackColor = System.Drawing.Color.FromArgb(0, 120, 215);
             btnPause.MouseEnter += (s, e) => btnPause.BackColor = System.Drawing.Color.FromArgb(200, 130, 0);
@@ -142,14 +197,19 @@ namespace Diplom
             btnStop.MouseLeave += (s, e) => btnStop.BackColor = System.Drawing.Color.FromArgb(220, 53, 69);
             btnSaveToFile.MouseEnter += (s, e) => btnSaveToFile.BackColor = System.Drawing.Color.FromArgb(30, 140, 60);
             btnSaveToFile.MouseLeave += (s, e) => btnSaveToFile.BackColor = System.Drawing.Color.FromArgb(40, 167, 69);
+            btnRefreshSuspicious.MouseEnter += (s, e) => btnRefreshSuspicious.BackColor = System.Drawing.Color.FromArgb(0, 120, 110);
+            btnRefreshSuspicious.MouseLeave += (s, e) => btnRefreshSuspicious.BackColor = System.Drawing.Color.FromArgb(0, 150, 136);
+            btnClearDatabase.MouseEnter += (s, e) => btnClearDatabase.BackColor = System.Drawing.Color.FromArgb(123, 40, 164);
+            btnClearDatabase.MouseLeave += (s, e) => btnClearDatabase.BackColor = System.Drawing.Color.FromArgb(153, 50, 204);
 
-            // Шрифты
             Font = new System.Drawing.Font("Segoe UI", 9.75F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
             chkShowListeningPorts.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
             btnStart.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
             btnPause.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
             btnStop.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
             btnSaveToFile.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
+            btnRefreshSuspicious.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
+            btnClearDatabase.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point);
         }
 
         private void InitializeChart()
@@ -205,13 +265,10 @@ namespace Diplom
                     receivedTrafficValues.RemoveAt(0);
                 }
 
-                Console.WriteLine($"[UpdateTrafficGraph] Sent: {totalSentBs:F0} B/s, Received: {totalReceivedBs:F0} B/s, TimeStamps Count: {timeStamps.Count}");
-
                 formsPlotTraffic.Plot.Clear();
                 var timeValues = timeStamps.Select(t => t.ToOADate()).ToArray();
                 if (timeValues.Length == 0 || sentTrafficValues.Count == 0 || receivedTrafficValues.Count == 0)
                 {
-                    Console.WriteLine("[UpdateTrafficGraph] No data to plot.");
                     formsPlotTraffic.Refresh();
                     return;
                 }
@@ -245,25 +302,18 @@ namespace Diplom
                 var devices = LibPcapLiveDeviceList.Instance;
                 if (devices.Count == 0)
                 {
-                    MessageBox.Show("No network devices found. Please ensure Npcap or WinPcap is installed and 'wpcap.dll' is available in C:\\Windows\\System32.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("No network devices found. Please ensure Npcap or WinPcap is installed.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
                 captureDevice = devices.FirstOrDefault(d => ((LibPcapLiveDevice)d).Addresses.Any(a => a.Addr?.ipAddress != null));
                 if (captureDevice == null)
                 {
-                    MessageBox.Show("No suitable network device found. Please select a device manually if needed.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("No suitable network device found.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
-                var selectedDevice = (LibPcapLiveDevice)captureDevice;
-                string selectedDeviceName = !string.IsNullOrEmpty(selectedDevice.Description) ? selectedDevice.Description : selectedDevice.Name;
-                Console.WriteLine($"Selected device: {selectedDeviceName}");
                 captureDevice.OnPacketArrival += new PacketArrivalEventHandler(CaptureDevice_OnPacketArrivalAsync);
-            }
-            catch (DllNotFoundException ex)
-            {
-                MessageBox.Show($"Unable to load 'wpcap.dll': {ex.Message}\nPlease install Npcap with WinPcap API compatibility mode and restart your computer.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
@@ -336,8 +386,6 @@ namespace Diplom
                                         received += length;
                                     queue.Dequeue();
                                     queue.Enqueue((sent, received, DateTime.Now));
-
-                                    Console.WriteLine($"[CaptureDevice] PID: {pid}, Sent: {sent}, Received: {received}, Queue Count: {queue.Count}");
                                 }
                             }
                         }
@@ -355,6 +403,24 @@ namespace Diplom
                         {
                             protocol = "ICMP";
                         }
+                    }
+
+                    string reason = "";
+                    bool isSuspicious = false;
+                    if (length > PacketLengthThreshold)
+                    {
+                        reason = $"Length exceeds {PacketLengthThreshold} bytes";
+                        isSuspicious = true;
+                    }
+                    else if (protocol == "Unknown")
+                    {
+                        reason = "Unknown protocol";
+                        isSuspicious = true;
+                    }
+
+                    if (isSuspicious)
+                    {
+                        SaveSuspiciousPacket(source, destination, protocol, length, timestamp, sourcePort, destPort, reason);
                     }
 
                     bool isNormalPacket = length <= 1500 && (protocol == "TCP" || protocol == "UDP" || protocol == "HTTP" || protocol == "ICMP");
@@ -386,6 +452,29 @@ namespace Diplom
                     }));
                 }
             });
+        }
+
+        private void SaveSuspiciousPacket(string source, string destination, string protocol, int length, string timestamp, string sourcePort, string destPort, string reason)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand("INSERT INTO SuspiciousPackets (Source, Destination, Protocol, Length, Timestamp, SourcePort, DestPort, Reason) VALUES (@source, @dest, @protocol, @length, @timestamp, @srcPort, @dstPort, @reason)", dbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@source", source);
+                    cmd.Parameters.AddWithValue("@dest", destination);
+                    cmd.Parameters.AddWithValue("@protocol", protocol);
+                    cmd.Parameters.AddWithValue("@length", length);
+                    cmd.Parameters.AddWithValue("@timestamp", timestamp);
+                    cmd.Parameters.AddWithValue("@srcPort", sourcePort);
+                    cmd.Parameters.AddWithValue("@dstPort", destPort);
+                    cmd.Parameters.AddWithValue("@reason", reason);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SaveSuspiciousPacket] Error: {ex.Message}");
+            }
         }
 
         private void PacketUpdateTimer_Tick(object sender, EventArgs e)
@@ -515,6 +604,12 @@ namespace Diplom
                             double avgSentBs = totalTime > 0 ? totalSent / totalTime : 0;
                             double avgReceivedBs = totalTime > 0 ? totalReceived / totalTime : 0;
                             processTrafficData[pid] = (avgSentBs, avgReceivedBs);
+
+                            double totalTrafficBs = avgSentBs + avgReceivedBs;
+                            if (totalTrafficBs > TrafficThresholdMBps)
+                            {
+                                SaveSuspiciousProcess(pid, processNameCache.ContainsKey(pid) ? processNameCache[pid] : "Unknown", totalTrafficBs, DateTime.Now.ToString("HH:mm:ss"), $"Traffic exceeds {TrafficThresholdMBps / (1024 * 1024)} MB/s");
+                            }
                         }
                     }
                 }
@@ -601,11 +696,30 @@ namespace Diplom
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in UpdateNetworkActivity: {ex.Message}");
                 BeginInvoke(new Action(() =>
                 {
                     MessageBox.Show($"Error updating network activity: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }));
+            }
+        }
+
+        private void SaveSuspiciousProcess(int pid, string processName, double totalTrafficBs, string timestamp, string reason)
+        {
+            try
+            {
+                using (var cmd = new SQLiteCommand("INSERT INTO SuspiciousProcesses (Pid, ProcessName, AvgTrafficBs, Timestamp, Reason) VALUES (@pid, @processName, @traffic, @timestamp, @reason)", dbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@pid", pid);
+                    cmd.Parameters.AddWithValue("@processName", processName);
+                    cmd.Parameters.AddWithValue("@traffic", totalTrafficBs);
+                    cmd.Parameters.AddWithValue("@timestamp", timestamp);
+                    cmd.Parameters.AddWithValue("@reason", reason);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SaveSuspiciousProcess] Error: {ex.Message}");
             }
         }
 
@@ -720,7 +834,6 @@ namespace Diplom
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in UpdateNetworkTraffic: {ex.Message}");
                 BeginInvoke(new Action(() =>
                 {
                     MessageBox.Show($"Error updating network traffic: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -765,11 +878,66 @@ namespace Diplom
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in UpdateTcpConnections: {ex.Message}");
                 BeginInvoke(new Action(() =>
                 {
                     MessageBox.Show($"Error updating TCP connections: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }));
+            }
+        }
+
+        private void LoadSuspiciousData()
+        {
+            try
+            {
+                listViewSuspicious.BeginUpdate();
+                listViewSuspicious.Items.Clear();
+
+                using (var cmd = new SQLiteCommand("SELECT * FROM SuspiciousPackets ORDER BY Timestamp DESC", dbConnection))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var item = new ListViewItem(new[]
+                        {
+                            "Packet",
+                            reader["Source"].ToString(),
+                            reader["Destination"].ToString(),
+                            reader["Protocol"].ToString(),
+                            reader["Length"].ToString(),
+                            reader["Timestamp"].ToString(),
+                            reader["SourcePort"].ToString(),
+                            reader["DestPort"].ToString(),
+                            reader["Reason"].ToString()
+                        });
+                        listViewSuspicious.Items.Add(item);
+                    }
+                }
+
+                using (var cmd = new SQLiteCommand("SELECT * FROM SuspiciousProcesses ORDER BY Timestamp DESC", dbConnection))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        var item = new ListViewItem(new[]
+                        {
+                            "Process",
+                            reader["Pid"].ToString(),
+                            reader["ProcessName"].ToString(),
+                            reader["AvgTrafficBs"].ToString(),
+                            reader["Timestamp"].ToString(),
+                            "",
+                            "",
+                            reader["Reason"].ToString()
+                        });
+                        listViewSuspicious.Items.Add(item);
+                    }
+                }
+
+                listViewSuspicious.EndUpdate();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error loading suspicious data: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -846,7 +1014,6 @@ namespace Diplom
                     captureDevice.Open(DeviceModes.Promiscuous | DeviceModes.MaxResponsiveness, 1000);
                     captureDevice.StartCapture();
                     isCapturing = true;
-                    Console.WriteLine("Capture started successfully.");
                 }
                 catch (Exception ex)
                 {
@@ -881,7 +1048,6 @@ namespace Diplom
                     captureDevice.StopCapture();
                     captureDevice.Close();
                     isCapturing = false;
-                    Console.WriteLine("Capture stopped successfully.");
                 }
                 catch (Exception ex)
                 {
@@ -896,6 +1062,7 @@ namespace Diplom
             listViewNetworkTraffic.Items.Clear();
             listViewTcpConnections.Items.Clear();
             listViewUdpListeners.Items.Clear();
+            listViewSuspicious.Items.Clear();
             lock (packetQueue)
             {
                 packetQueue.Clear();
@@ -958,6 +1125,13 @@ namespace Diplom
                         {
                             writer.WriteLine($"{item.SubItems[0].Text} | {item.SubItems[1].Text} | {item.SubItems[2].Text} | {item.SubItems[3].Text}");
                         }
+                        writer.WriteLine();
+
+                        writer.WriteLine("Suspicious Activity:");
+                        foreach (ListViewItem item in listViewSuspicious.Items)
+                        {
+                            writer.WriteLine($"Type: {item.SubItems[0].Text} | Source/PID: {item.SubItems[1].Text} | Dest/Process: {item.SubItems[2].Text} | Protocol/Traffic: {item.SubItems[3].Text} | Length: {item.SubItems[4].Text} | Timestamp: {item.SubItems[5].Text} | Src Port: {item.SubItems[6].Text} | Dst Port: {item.SubItems[7].Text} | Reason: {item.SubItems[8].Text}");
+                        }
 
                         writer.WriteLine();
                         writer.WriteLine("Traffic Graph Data:");
@@ -968,6 +1142,48 @@ namespace Diplom
                     }
                     MessageBox.Show($"Data saved to {saveFileDialog.FileName}", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
+            }
+        }
+
+        private void BtnRefreshSuspicious_Click(object sender, EventArgs e)
+        {
+            LoadSuspiciousData();
+        }
+
+        private void BtnClearDatabase_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                // Подтверждение действия от пользователя
+                DialogResult result = MessageBox.Show(
+                    "Are you sure you want to clear all data from the database? This action cannot be undone.",
+                    "Confirm Database Clear",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning
+                );
+
+                if (result == DialogResult.Yes)
+                {
+                    // Очистка таблиц SuspiciousPackets и SuspiciousProcesses
+                    using (var cmd = new SQLiteCommand("DELETE FROM SuspiciousPackets", dbConnection))
+                    {
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    using (var cmd = new SQLiteCommand("DELETE FROM SuspiciousProcesses", dbConnection))
+                    {
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    // Очистка отображаемого списка подозрительной активности
+                    listViewSuspicious.Items.Clear();
+
+                    MessageBox.Show("Database has been successfully cleared.", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error clearing database: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
     }
@@ -1115,5 +1331,21 @@ namespace Diplom
             }
             return connections;
         }
+    }
+
+    public enum TcpState : uint
+    {
+        Closed = 1,
+        Listening = 2,
+        SynSent = 3,
+        SynReceived = 4,
+        Established = 5,
+        FinWait1 = 6,
+        FinWait2 = 7,
+        CloseWait = 8,
+        Closing = 9,
+        LastAck = 10,
+        TimeWait = 11,
+        DeleteTcb = 12
     }
 }
